@@ -66,6 +66,10 @@ iMessage ──Spectrum──▶ ingest ──▶ SQLite (transcripts, people, f
 - **Proactive.** `schedule_followup` lets Juno nudge someone who hasn't answered or remind the crew before dinner. When a follow-up comes due, Claude first rereads the chat to check it still makes sense.
 - **Sees photos.** Image attachments go to Claude with vision. HEIC files from iPhones are converted with macOS `sips`.
 
+## Demo
+
+[DEMO.md](DEMO.md) is the 3-minute judging script: setup checklist, timed beats with the exact texts to send, fallbacks, and judge Q&A.
+
 ## Code
 
 | File | What |
