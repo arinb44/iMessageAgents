@@ -1,10 +1,10 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
-import { type Attachment, type Content, type Message, type Space, Spectrum } from "spectrum-ts";
+import { type Attachment, type Content, type ContentInput, type Message, type Space, Spectrum } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 import { terminal } from "spectrum-ts/providers/terminal";
-import { think } from "./brain";
+import { type Chat, think } from "./brain";
 import { config } from "./config";
 import { memory, type Reminder } from "./memory";
 
@@ -28,14 +28,14 @@ process.once("SIGTERM", shutdown);
 
 console.log(
   `${config.agentName} is up on ${[config.hasPhotonCredentials && "iMessage", useTerminal && "terminal"].filter(Boolean).join(" + ")}` +
-    (useTerminal ? ' — tip: type "Maya: hey all" to speak as someone else and test group behavior' : ""),
+    (useTerminal ? ' — tip: type "Maya: hey" to text Juno privately as Maya' : ""),
 );
 
 // ---------------------------------------------------------------------------
 // Live object caches. Spectrum objects can't be persisted, so we keep recent
 // ones in memory and fall back to looking them up by id.
 
-const spaces = new Map<string, Space>();
+const spaces = new Map<string, Chat>();
 const liveMessages = new Map<number, Message>();
 const LIVE_MESSAGE_CAP = 2000;
 
@@ -46,9 +46,10 @@ function cacheMessage(seq: number, message: Message) {
   }
 }
 
-async function resolveSpace(id: string): Promise<Space | undefined> {
+async function resolveSpace(id: string): Promise<Chat | undefined> {
   const cached = spaces.get(id);
   if (cached) return cached;
+  if (id.startsWith(SIM_DM_PREFIX)) return terminalBase && simChat(id.slice(SIM_DM_PREFIX.length));
   const row = memory.space(id);
   try {
     if (row?.platform === "imessage" && config.hasPhotonCredentials) return await imessage(app).space.get(id);
@@ -59,7 +60,68 @@ async function resolveSpace(id: string): Promise<Space | undefined> {
   return undefined;
 }
 
-async function resolveMessage(space: Space, seq: number): Promise<Message | undefined> {
+// ---------------------------------------------------------------------------
+// Reaching people 1:1, so the agent can coordinate a crew across their DMs.
+
+// Spectrum identifies iMessage users by E.164 phone number (or email).
+function normalizeHandle(raw: string): string | null {
+  const s = raw.trim();
+  if (s.includes("@")) return s.toLowerCase();
+  const digits = s.replace(/\D/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  if (s.startsWith("+") && digits.length >= 8) return `+${digits}`;
+  return null;
+}
+
+// In the terminal, "Maya: hi" is Maya texting the agent privately. Each
+// simulated person gets a virtual DM; the agent's replies to them show up in
+// the one real terminal chat, prefixed with who they're for.
+const SIM_DM_PREFIX = "sim-dm:";
+let terminalBase: Space | undefined;
+
+function simChat(personId: string): Chat {
+  const base = terminalBase;
+  if (!base) throw new Error("the terminal chat isn't open");
+  const name = memory.nameOf(personId) ?? personId.replace(/^sim:/, "");
+  const send = ((content: ContentInput) =>
+    base.send(typeof content === "string" ? `[to ${name}] ${content}` : content)) as Chat["send"];
+  return {
+    id: `${SIM_DM_PREFIX}${personId}`,
+    send,
+    startTyping: async () => {},
+    stopTyping: async () => {},
+    getMessage: (id) => base.getMessage(id),
+  };
+}
+
+async function openDm(personId: string): Promise<Chat> {
+  if (personId.startsWith("sim:")) return simChat(personId);
+
+  const known = memory.dmSpaceOf(personId);
+  const existing = known && (await resolveSpace(known));
+  if (existing) return existing;
+
+  if (!config.hasPhotonCredentials) throw new Error("iMessage isn't connected");
+  const im = imessage(app);
+  const space = await im.space.create(await im.user(personId));
+  spaces.set(space.id, space);
+  memory.upsertSpace(space.id, "imessage", "dm");
+  memory.setDmSpace(personId, space.id);
+  return space;
+}
+
+function personIdFor(platform: string) {
+  return ({ name, phone }: { name: string; phone?: string }): string => {
+    if (platform === "terminal") return `sim:${name.toLowerCase().replace(/\s+/g, "-")}`;
+    if (!phone) throw new Error("need their phone number to text them");
+    const handle = normalizeHandle(phone);
+    if (!handle) throw new Error(`"${phone}" doesn't look like a phone number`);
+    return handle;
+  };
+}
+
+async function resolveMessage(space: Chat, seq: number): Promise<Message | undefined> {
   const live = liveMessages.get(seq);
   if (live) return live;
   const row = memory.bySeq(seq);
@@ -172,8 +234,9 @@ async function describe(content: Content): Promise<Described | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-chat scheduling. Messages in a burst are debounced into one think, and
-// a chat never has two thinks running at once.
+// Scheduling. Messages in a burst are debounced into one think per chat, and
+// only one think runs at a time overall: thinks in different DMs can edit the
+// same crew plan, and running them one by one keeps those edits from racing.
 
 interface ChatState {
   timer?: ReturnType<typeof setTimeout>;
@@ -182,43 +245,58 @@ interface ChatState {
   images: Anthropic.Beta.BetaImageBlockParam[];
   followups: Reminder[];
 }
-const chats = new Map<string, ChatState>();
+const chatStates = new Map<string, ChatState>();
 
-function chat(spaceId: string): ChatState {
-  let state = chats.get(spaceId);
+function stateOf(spaceId: string): ChatState {
+  let state = chatStates.get(spaceId);
   if (!state) {
     state = { running: false, dirty: false, images: [], followups: [] };
-    chats.set(spaceId, state);
+    chatStates.set(spaceId, state);
   }
   return state;
 }
 
+let thinking: Promise<unknown> = Promise.resolve();
+function oneAtATime<T>(fn: () => Promise<T>): Promise<T> {
+  const next = thinking.then(fn);
+  thinking = next.catch(() => {});
+  return next;
+}
+
 function schedule(spaceId: string) {
-  const state = chat(spaceId);
+  const state = stateOf(spaceId);
   clearTimeout(state.timer);
   const kind = memory.space(spaceId)?.kind ?? "dm";
   state.timer = setTimeout(() => void run(spaceId), config.debounceMs[kind]);
 }
 
 async function run(spaceId: string) {
-  const state = chat(spaceId);
+  const state = stateOf(spaceId);
   if (state.running) {
     state.dirty = true;
     return;
   }
-  const space = await resolveSpace(spaceId);
-  if (!space) return;
+  const chat = await resolveSpace(spaceId);
+  if (!chat) return;
 
   state.running = true;
-  const images = state.images.splice(0);
-  const followups = state.followups.splice(0);
   try {
-    await think({
-      space,
-      kind: memory.space(spaceId)?.kind ?? "dm",
-      images,
-      followups,
-      resolveMessage: (seq) => resolveMessage(space, seq),
+    await oneAtATime(() => {
+      // Taken once the think actually starts, so anything that arrived while
+      // waiting for the lock is included.
+      const images = state.images.splice(0);
+      const followups = state.followups.splice(0);
+      const platform = memory.space(spaceId)?.platform ?? "imessage";
+      return think({
+        chat,
+        kind: memory.space(spaceId)?.kind ?? "dm",
+        images,
+        followups,
+        resolveMessage: (seq) => resolveMessage(chat, seq),
+        openDm,
+        personIdFor: personIdFor(platform),
+        platform,
+      });
     });
   } catch (err) {
     console.error(`[think] ${spaceId}:`, err);
@@ -235,7 +313,7 @@ async function run(spaceId: string) {
 setInterval(() => {
   for (const reminder of memory.dueReminders()) {
     memory.completeReminder(reminder.id);
-    chat(reminder.spaceId).followups.push(reminder);
+    stateOf(reminder.spaceId).followups.push(reminder);
     void run(reminder.spaceId);
   }
 }, 15_000);
@@ -243,18 +321,25 @@ setInterval(() => {
 // ---------------------------------------------------------------------------
 // /memory: a quick way to show (or demo) what the agent has retained.
 
-async function sendMemoryDump(space: Space) {
+async function sendMemoryDump(chat: Chat) {
   const lines: string[] = [];
-  for (const id of memory.participants(space.id)) {
-    const facts = memory.factsAbout(id).filter((f) => f.spaceId === space.id);
+  const people = memory.participants(chat.id);
+  for (const id of people) {
+    const facts = memory.factsAbout(id).filter((f) => f.spaceId === chat.id);
     lines.push(`${memory.nameOf(id) ?? id}${facts.length ? "" : ": (nothing yet)"}`);
     for (const f of facts) lines.push(`  • ${f.fact}`);
   }
-  for (const f of memory.factsAbout(`chat:${space.id}`)) lines.push(`chat • ${f.fact}`);
-  for (const r of memory.pendingReminders(space.id)) {
+  for (const f of memory.factsAbout(`chat:${chat.id}`)) lines.push(`chat • ${f.fact}`);
+  const crews = new Map(people.flatMap((id) => memory.crewsOf(id)).map((c) => [c.id, c]));
+  for (const crew of crews.values()) {
+    const members = memory.crewMembers(crew.id).map((id) => memory.nameOf(id) ?? id);
+    lines.push(`👥 ${crew.name}: ${members.join(", ")}`);
+    if (crew.plan) lines.push(`  plan: ${crew.plan}`);
+  }
+  for (const r of memory.pendingReminders(chat.id)) {
     lines.push(`⏰ ${new Date(r.dueAt).toLocaleString()}: ${r.note}`);
   }
-  await space.send(lines.join("\n") || "nothing remembered here yet");
+  await chat.send(lines.join("\n") || "nothing remembered here yet");
 }
 
 // ---------------------------------------------------------------------------
@@ -263,44 +348,45 @@ async function sendMemoryDump(space: Space) {
 const SIMULATED_SPEAKER = /^([A-Za-z][\w'-]{0,19}):\s+([\s\S]+)$/;
 
 async function ingest(space: Space, message: Message) {
-  spaces.set(space.id, space);
-
   const described = await describe(message.content);
   if (!described) return;
 
+  let chat: Chat = space;
   let senderId = message.sender?.id ?? "unknown";
   let text = described.text;
-  let simulated = false;
 
-  // Terminal only: "Name: text" speaks as a different person, so one
-  // developer can act out a whole group chat.
+  // Terminal only: "Name: text" is that person texting the agent privately,
+  // so one developer can act out a whole crew.
   if (message.platform === "terminal") {
+    terminalBase = space;
     const match = SIMULATED_SPEAKER.exec(text);
     if (match) {
       const [, name, rest] = match;
       senderId = `sim:${name!.toLowerCase()}`;
       memory.setName(senderId, name!);
       text = rest!;
-      simulated = true;
+      chat = simChat(senderId);
     }
   }
+  spaces.set(chat.id, chat);
 
   if (text.trim() === "/memory") {
-    await sendMemoryDump(space);
+    await sendMemoryDump(chat);
     return;
   }
 
-  const isGroup = (space as { type?: string }).type === "group" || simulated;
-  memory.upsertSpace(space.id, message.platform, isGroup ? "group" : "dm");
+  const isGroup = (space as { type?: string }).type === "group";
+  memory.upsertSpace(chat.id, message.platform, isGroup ? "group" : "dm");
+  if (!isGroup) memory.setDmSpace(senderId, chat.id);
 
-  const seq = memory.addMessage(space.id, message.id, senderId, text, message.timestamp.getTime());
+  const seq = memory.addMessage(chat.id, message.id, senderId, text, message.timestamp.getTime());
   cacheMessage(seq, message);
   console.log(
-    `[${isGroup ? "group" : "dm"} …${space.id.slice(-6)}] #${seq} ${memory.nameOf(senderId) ?? senderId}: ${text.slice(0, 100)}`,
+    `[${isGroup ? "group" : "dm"} …${chat.id.slice(-6)}] #${seq} ${memory.nameOf(senderId) ?? senderId}: ${text.slice(0, 100)}`,
   );
-  chat(space.id).images.push(...described.images);
+  stateOf(chat.id).images.push(...described.images);
 
-  if (described.triggers) schedule(space.id);
+  if (described.triggers) schedule(chat.id);
 }
 
 for await (const [space, message] of app.messages) {
