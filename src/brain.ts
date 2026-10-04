@@ -141,7 +141,10 @@ function buildTools(input: ThinkInput) {
         serial(async () => {
           const target = await resolveMessage(message);
           if (!target) return `Couldn't find message #${message}.`;
-          await target.react(Emoji[reaction]);
+          // Spectrum resolves undefined (rather than throwing) when the
+          // platform can't do tapbacks.
+          const sent = await target.react(Emoji[reaction]);
+          if (!sent) return "Tapbacks aren't supported here; nothing was sent.";
           memory.addMessage(spaceId, null, AGENT_ID, `[reacted ${Emoji[reaction]} to #${message}]`);
           return "reacted";
         }),
@@ -156,12 +159,15 @@ function buildTools(input: ThinkInput) {
       }),
       run: ({ question, options }) =>
         serial(async () => {
+          const unsupported = "Polls aren't supported here, so nothing was posted. Ask in a normal message instead.";
           try {
+            // Unsupported platforms skip the poll and resolve undefined.
             const sent = await space.send(poll(question, options));
-            memory.addMessage(spaceId, sent?.id ?? null, AGENT_ID, `[poll] ${question} — ${options.join(" / ")}`);
+            if (!sent) return unsupported;
+            memory.addMessage(spaceId, sent.id, AGENT_ID, `[poll] ${question} — ${options.join(" / ")}`);
             return "poll posted";
-          } catch (err) {
-            return `Polls aren't supported here (${(err as Error).message}). Ask in a normal message instead.`;
+          } catch {
+            return unsupported;
           }
         }),
     }),
