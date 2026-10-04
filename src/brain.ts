@@ -25,6 +25,15 @@ export interface ThinkInput {
 const TAPBACKS = ["love", "like", "dislike", "laugh", "emphasize", "question"] as const;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// The model occasionally leaks HTML like "</br>" into a bubble. Line breaks
+// become real newlines; other tags are dropped. Only real tags match, so
+// things like "<3" survive.
+const cleanBubble = (text: string) =>
+  text
+    .replace(/<\/?br\s*\/?>/gi, "\n")
+    .replace(/<\/?[a-z][a-z0-9]*\s*\/?>/gi, "")
+    .trim();
 const typingMs = (text: string) => Math.min(500 + text.length * 35, 3500);
 
 const fmtTime = (ts: number) =>
@@ -109,7 +118,7 @@ function buildTools(input: ThinkInput, actions: string[]) {
       run: ({ bubbles, reply_to }) =>
         serial(async () => {
           const target = reply_to ? await resolveMessage(reply_to) : undefined;
-          for (const [i, text] of bubbles.entries()) {
+          for (const [i, text] of bubbles.map(cleanBubble).filter(Boolean).entries()) {
             if (config.typingDelay) {
               await space.startTyping();
               await sleep(typingMs(text));
