@@ -104,10 +104,11 @@ async function openDm(personId: string): Promise<Chat> {
 
   if (!config.hasPhotonCredentials) throw new Error("iMessage isn't connected");
   const im = imessage(app);
+  // Recorded as this person's DM only after a send succeeds (see text_person):
+  // Photon can create the chat and still refuse to deliver into it.
   const space = await im.space.create(await im.user(personId));
   spaces.set(space.id, space);
   memory.upsertSpace(space.id, "imessage", "dm");
-  memory.setDmSpace(personId, space.id);
   return space;
 }
 

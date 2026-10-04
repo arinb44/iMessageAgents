@@ -168,6 +168,15 @@ function buildTools(input: ThinkInput, actions: string[]) {
   // Crews are only reachable from a chat that one of their members is in.
   const crewHere = (crewId: number) => crewsHere(spaceId).find((c) => c.id === crewId);
 
+  // Claude can issue a text_person together with a message announcing it
+  // worked, before seeing the result. If the text fails, bounce anything that
+  // was issued before the failure so Claude rewrites it knowing the outcome.
+  let lastFailure: { at: number; what: string } | undefined;
+  const staleSince = (issuedAt: number) =>
+    lastFailure && lastFailure.at >= issuedAt
+      ? `Not done: ${lastFailure.what} failed in this same step, so this may claim something that didn't happen. Redo it knowing that.`
+      : undefined;
+
   // Resolves people to ids (recording their names), collecting any that can't be.
   const resolvePeople = (people: { name: string; phone?: string }[]) => {
     const ids: string[] = [];
@@ -198,13 +207,17 @@ function buildTools(input: ThinkInput, actions: string[]) {
         bubbles: z.array(z.string().min(1)).min(1).max(4),
         reply_to: z.number().int().optional().describe("Message number (#) to thread the first bubble under"),
       }),
-      run: ({ bubbles, reply_to }) =>
-        serial(async () => {
+      run: ({ bubbles, reply_to }) => {
+        const issuedAt = Date.now();
+        return serial(async () => {
+          const stale = staleSince(issuedAt);
+          if (stale) return stale;
           const target = reply_to ? await resolveMessage(reply_to) : undefined;
           const sent = await deliver(chat, bubbles, target && reply_to ? { target, seq: reply_to } : undefined);
           actions.push(`said "${sent.join(" / ")}"`);
           return "sent";
-        }),
+        });
+      },
     }),
 
     betaZodTool({
@@ -224,12 +237,20 @@ function buildTools(input: ThinkInput, actions: string[]) {
           const reachable = crewsHere(spaceId).some((c) => memory.crewMembers(c.id).includes(person_id));
           if (!reachable) return `${name} isn't in any crew with the people in this chat.`;
           let dm: Chat;
+          let sent: string[];
           try {
             dm = await openDm(person_id);
+            sent = await deliver(dm, bubbles);
           } catch (err) {
-            return `Couldn't reach ${name}: ${errorText(err)}`;
+            const reason = errorText(err);
+            console.error(`[text_person] couldn't reach ${name} (${person_id}): ${reason}`);
+            lastFailure = { at: Date.now(), what: `texting ${name}` };
+            memory.addMessage(spaceId, null, AGENT_ID, `[tried to text ${name} privately, but it failed: ${reason}]`);
+            actions.push(`failed to text ${name}`);
+            return `Couldn't reach ${name}: ${reason}. Nothing was delivered.`;
           }
-          const sent = await deliver(dm, bubbles);
+          // Only now is the 1:1 chat known to work.
+          memory.setDmSpace(person_id, dm.id);
           memory.addMessage(spaceId, null, AGENT_ID, `[texted ${name} privately: "${sent.join(" / ")}"]`);
           actions.push(`texted ${name} "${sent.join(" / ")}"`);
           return "sent";
@@ -287,12 +308,17 @@ function buildTools(input: ThinkInput, actions: string[]) {
         crew_id: z.number().int(),
         plan: z.string().min(1),
       }),
-      run: async ({ crew_id, plan }) => {
-        const crew = crewHere(crew_id);
-        if (!crew) return `Crew ${crew_id} isn't one of the crews in <crews>.`;
-        memory.setPlan(crew_id, plan);
-        actions.push(`updated plan for "${crew.name}"`);
-        return "updated";
+      run: ({ crew_id, plan }) => {
+        const issuedAt = Date.now();
+        return serial(async () => {
+          const stale = staleSince(issuedAt);
+          if (stale) return stale;
+          const crew = crewHere(crew_id);
+          if (!crew) return `Crew ${crew_id} isn't one of the crews in <crews>.`;
+          memory.setPlan(crew_id, plan);
+          actions.push(`updated plan for "${crew.name}"`);
+          return "updated";
+        });
       },
     }),
 
