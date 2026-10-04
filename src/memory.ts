@@ -79,6 +79,26 @@ db.exec(`
     kind TEXT NOT NULL,
     last_seen_seq INTEGER NOT NULL DEFAULT 0
   );
+
+  -- Each person's 1:1 chat with the agent, so it can text them first.
+  CREATE TABLE IF NOT EXISTS dm_spaces (
+    person_id TEXT PRIMARY KEY,
+    space_id TEXT NOT NULL
+  );
+
+  -- A crew is a set of people the agent coordinates across their DMs.
+  CREATE TABLE IF NOT EXISTS crews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    plan TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    ts INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS crew_members (
+    crew_id INTEGER NOT NULL,
+    person_id TEXT NOT NULL,
+    PRIMARY KEY (crew_id, person_id)
+  );
 `);
 
 const q = {
@@ -126,7 +146,34 @@ const q = {
     "SELECT id, platform, kind, last_seen_seq AS lastSeenSeq FROM spaces WHERE id = ?",
   ),
   markSeen: db.query<never, [number, string]>("UPDATE spaces SET last_seen_seq = ? WHERE id = ?"),
+
+  setDmSpace: db.query<never, [string, string]>(
+    "INSERT INTO dm_spaces (person_id, space_id) VALUES (?, ?) ON CONFLICT (person_id) DO UPDATE SET space_id = excluded.space_id",
+  ),
+  dmSpace: db.query<{ spaceId: string }, [string]>("SELECT space_id AS spaceId FROM dm_spaces WHERE person_id = ?"),
+
+  insertCrew: db.query<{ id: number }, [string, string, number]>(
+    "INSERT INTO crews (name, created_by, ts) VALUES (?, ?, ?) RETURNING id",
+  ),
+  addCrewMember: db.query<never, [number, string]>(
+    "INSERT OR IGNORE INTO crew_members (crew_id, person_id) VALUES (?, ?)",
+  ),
+  crewsOf: db.query<Crew, [string]>(`
+    SELECT c.id, c.name, c.plan, c.created_by AS createdBy FROM crews c
+    JOIN crew_members m ON m.crew_id = c.id WHERE m.person_id = ? ORDER BY c.id`),
+  crew: db.query<Crew, [number]>("SELECT id, name, plan, created_by AS createdBy FROM crews WHERE id = ?"),
+  crewMembers: db.query<{ personId: string }, [number]>(
+    "SELECT person_id AS personId FROM crew_members WHERE crew_id = ? ORDER BY rowid",
+  ),
+  setPlan: db.query<never, [string, number]>("UPDATE crews SET plan = ? WHERE id = ?"),
 };
+
+export interface Crew {
+  id: number;
+  name: string;
+  plan: string;
+  createdBy: string;
+}
 
 export const memory = {
   addMessage(spaceId: string, platformId: string | null, senderId: string, text: string, ts = Date.now()): number {
@@ -181,5 +228,33 @@ export const memory = {
   },
   markSeen(spaceId: string, seq: number) {
     q.markSeen.run(seq, spaceId);
+  },
+
+  setDmSpace(personId: string, spaceId: string) {
+    q.setDmSpace.run(personId, spaceId);
+  },
+  dmSpaceOf(personId: string): string | null {
+    return q.dmSpace.get(personId)?.spaceId ?? null;
+  },
+
+  createCrew(name: string, createdBy: string, memberIds: string[]): number {
+    const id = q.insertCrew.get(name, createdBy, Date.now())!.id;
+    for (const personId of [createdBy, ...memberIds]) q.addCrewMember.run(id, personId);
+    return id;
+  },
+  addToCrew(crewId: number, personId: string) {
+    q.addCrewMember.run(crewId, personId);
+  },
+  crewsOf(personId: string): Crew[] {
+    return q.crewsOf.all(personId);
+  },
+  crew(id: number): Crew | null {
+    return q.crew.get(id);
+  },
+  crewMembers(crewId: number): string[] {
+    return q.crewMembers.all(crewId).map((r) => r.personId);
+  },
+  setPlan(crewId: number, plan: string) {
+    q.setPlan.run(plan, crewId);
   },
 };
