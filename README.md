@@ -40,7 +40,7 @@ Sam: can't do friday, saturday works
 
 Juno's texts to other people show up as `[to Maya] …`. `/memory` shows what Juno has retained in the current chat, including crews and their plans.
 
-**To go live on iMessage**, put `SPECTRUM_PROJECT_ID` and `SPECTRUM_PROJECT_SECRET` (from Settings at [app.photon.codes](https://app.photon.codes)) in `.env` and restart. Everyone who'll text Juno, or whom Juno will text, must be added under **Users** in the Photon dashboard (up to 10 on the free plan). Give Juno people's numbers when asking it to organize something. Set `TERMINAL=1` to keep the terminal UI open alongside.
+**To go live on iMessage**, put `SPECTRUM_PROJECT_ID` and `SPECTRUM_PROJECT_SECRET` (from Settings at [app.photon.codes](https://app.photon.codes)) in `.env` and restart. Everyone who'll text Juno, or whom Juno will text, must be added under **Users** in the Photon dashboard (up to 10 on the free plan). Each user gets their own Photon number shown there, so that's the number they'll get Juno's texts from. If Juno can't reach someone you just added, restart it so it picks up the new user. Give Juno people's numbers when asking it to organize something. Set `TERMINAL=1` to keep the terminal UI open alongside.
 
 > **Group chats:** Juno also behaves well inside group chats: it stays quiet unless it's useful, uses tapbacks, and posts polls. But Photon's free plan only delivers 1:1 messages. Group chats need a dedicated (Business) line.
 
