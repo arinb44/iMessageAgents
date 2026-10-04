@@ -84,7 +84,7 @@ function buildContext(input: ThinkInput, transcript: StoredMessage[], lastSeen: 
   return sections.join("\n\n");
 }
 
-function buildTools(input: ThinkInput) {
+function buildTools(input: ThinkInput, actions: string[]) {
   const { space, resolveMessage } = input;
   const spaceId = space.id;
 
@@ -126,6 +126,7 @@ function buildTools(input: ThinkInput) {
             );
           }
           if (config.typingDelay) await space.stopTyping();
+          actions.push(`said "${bubbles.join(" / ")}"`);
           return "sent";
         }),
     }),
@@ -146,6 +147,7 @@ function buildTools(input: ThinkInput) {
           const sent = await target.react(Emoji[reaction]);
           if (!sent) return "Tapbacks aren't supported here; nothing was sent.";
           memory.addMessage(spaceId, null, AGENT_ID, `[reacted ${Emoji[reaction]} to #${message}]`);
+          actions.push(`reacted ${Emoji[reaction]} to #${message}`);
           return "reacted";
         }),
     }),
@@ -163,8 +165,12 @@ function buildTools(input: ThinkInput) {
           try {
             // Unsupported platforms skip the poll and resolve undefined.
             const sent = await space.send(poll(question, options));
-            if (!sent) return unsupported;
+            if (!sent) {
+              actions.push("tried a poll (unsupported)");
+              return unsupported;
+            }
             memory.addMessage(spaceId, sent.id, AGENT_ID, `[poll] ${question} — ${options.join(" / ")}`);
+            actions.push(`posted poll "${question}"`);
             return "poll posted";
           } catch {
             return unsupported;
@@ -182,6 +188,7 @@ function buildTools(input: ThinkInput) {
       }),
       run: async ({ subject, fact }) => {
         memory.addFact(subject === "chat" ? `chat:${spaceId}` : subject, spaceId, fact);
+        actions.push(`remembered "${fact}"`);
         return "saved";
       },
     }),
@@ -195,6 +202,7 @@ function buildTools(input: ThinkInput) {
       }),
       run: async ({ person_id, name }) => {
         memory.setName(person_id, name);
+        actions.push(`learned name "${name}"`);
         return "saved";
       },
     }),
@@ -210,6 +218,7 @@ function buildTools(input: ThinkInput) {
       run: async ({ delay_minutes, note }) => {
         const dueAt = Date.now() + delay_minutes * 60_000;
         memory.addReminder(spaceId, dueAt, note);
+        actions.push(`scheduled follow-up for ${fmtTime(dueAt)}`);
         return `scheduled for ${fmtTime(dueAt)}`;
       },
     }),
@@ -231,13 +240,14 @@ export async function think(input: ThinkInput): Promise<void> {
     { type: "text", text: buildContext(input, transcript, lastSeen) },
   ];
 
+  const actions: string[] = [];
   const final = await client.beta.messages.toolRunner({
     model: config.model,
     max_tokens: 16000,
     max_iterations: 6,
     system: SYSTEM_PROMPT,
     output_config: { effort: config.effort },
-    tools: buildTools(input),
+    tools: buildTools(input, actions),
     messages: [{ role: "user", content }],
     ...(supportsFallbacks && {
       betas: ["server-side-fallback-2026-07-01"],
@@ -248,4 +258,5 @@ export async function think(input: ThinkInput): Promise<void> {
   if (final.stop_reason === "refusal") {
     console.warn(`[brain] refusal in ${spaceId}:`, final.stop_details?.category ?? "unknown");
   }
+  console.log(`  → ${actions.join(" · ") || "stayed quiet"}`);
 }

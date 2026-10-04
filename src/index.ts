@@ -295,6 +295,9 @@ async function ingest(space: Space, message: Message) {
 
   const seq = memory.addMessage(space.id, message.id, senderId, text, message.timestamp.getTime());
   cacheMessage(seq, message);
+  console.log(
+    `[${isGroup ? "group" : "dm"} …${space.id.slice(-6)}] #${seq} ${memory.nameOf(senderId) ?? senderId}: ${text.slice(0, 100)}`,
+  );
   chat(space.id).images.push(...described.images);
 
   if (described.triggers) schedule(space.id);
